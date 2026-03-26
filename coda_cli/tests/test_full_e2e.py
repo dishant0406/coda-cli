@@ -160,6 +160,13 @@ class FullE2ETests(unittest.TestCase):
         result = self.run_cli("pages", "get", "page-1", "--doc-id", "doc-1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("# Example Page", result.stdout)
+        self.assertIn("Resolving page", result.stderr)
+
+    def test_pages_find_shows_progress_while_fetching(self) -> None:
+        result = self.run_cli("pages", "find", "Example", "--doc-id", "doc-1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Example Page", result.stdout)
+        self.assertIn("Fetching pages", result.stderr)
 
     def test_tables_schema_json(self) -> None:
         result = self.run_cli("--json", "tables", "schema", "grid-1", "--doc-id", "doc-1")

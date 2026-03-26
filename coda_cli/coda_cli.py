@@ -3,6 +3,8 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -21,6 +23,54 @@ class AppContext:
     state: SessionState
     session_path: Path
     backend: Optional[CodaBackend]
+
+
+class ProgressSpinner:
+    def __init__(self, enabled: bool, initial_message: str):
+        self.enabled = enabled
+        self.message = initial_message
+        self._frames = "|/-\\"
+        self._frame_index = 0
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._last_render_width = 0
+
+    def __enter__(self) -> "ProgressSpinner":
+        if not self.enabled:
+            return self
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if not self.enabled:
+            return
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        stream = click.get_text_stream("stderr")
+        stream.write("\r" + (" " * self._last_render_width) + "\r")
+        stream.flush()
+
+    def update(self, message: str) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self.message = message
+
+    def _run(self) -> None:
+        stream = click.get_text_stream("stderr")
+        while not self._stop_event.is_set():
+            with self._lock:
+                message = self.message
+            frame = self._frames[self._frame_index % len(self._frames)]
+            rendered = f"{frame} {message}"
+            self._last_render_width = max(self._last_render_width, len(rendered))
+            stream.write("\r" + rendered.ljust(self._last_render_width))
+            stream.flush()
+            self._frame_index += 1
+            self._stop_event.wait(0.1)
 
 
 def main() -> None:
@@ -45,6 +95,13 @@ def main() -> None:
     default=None,
     help="Path to the local session file.",
 )
+@click.option(
+    "--timeout",
+    envvar="CODA_API_TIMEOUT",
+    type=float,
+    default=None,
+    help="Network timeout in seconds. Defaults to no timeout.",
+)
 @click.option("--json", "json_output", is_flag=True, help="Emit JSON output for automation.")
 @click.pass_context
 def cli(
@@ -52,6 +109,7 @@ def cli(
     api_key: Optional[str],
     api_base_url: Optional[str],
     session_path: Optional[Path],
+    timeout: Optional[float],
     json_output: bool,
 ) -> None:
     json_output = json_output or bool(ctx.meta.get("json_output_override"))
@@ -63,7 +121,7 @@ def cli(
         state.api_base_url = resolved_api_base_url
         store.save(state)
 
-    backend = CodaBackend(api_key=api_key, api_base_url=resolved_api_base_url) if api_key else None
+    backend = CodaBackend(api_key=api_key, api_base_url=resolved_api_base_url, timeout=timeout) if api_key else None
     ctx.obj = AppContext(
         json_output=json_output,
         store=store,
@@ -107,9 +165,8 @@ def _enable_json_output(ctx: click.Context, param: click.Parameter, value: bool)
     return value
 
 
-def emit_progress(app: AppContext, message: str) -> None:
-    if not app.json_output:
-        click.echo(message, err=True)
+def progress_spinner(app: AppContext, initial_message: str) -> ProgressSpinner:
+    return ProgressSpinner(enabled=not app.json_output, initial_message=initial_message)
 
 
 def require_backend(app: AppContext) -> CodaBackend:
@@ -396,8 +453,9 @@ def resolve_page(
     page_ref: Optional[str],
     page_path: Optional[str],
     label: str = "page",
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    pages = backend.list_all_pages(doc_id).get("items", [])
+    pages = backend.list_all_pages(doc_id, progress_callback=progress_callback).get("items", [])
     return resolve_page_from_inventory(
         app,
         pages,
@@ -475,10 +533,6 @@ def fuzzy_find_pages(
     return [page for _, page in scored]
 
 
-def progress_callback_for(app: AppContext) -> Callable[[str], None]:
-    return lambda message: emit_progress(app, message)
-
-
 @cli.group()
 def docs() -> None:
     """Document operations."""
@@ -537,26 +591,28 @@ def pages_list(
     use_inventory = bool(query or parent_page or parent_path or all_pages or long_mode)
 
     if use_inventory:
-        pages_payload = backend.list_all_pages(resolved_doc_id)
-        items = list(pages_payload.get("items", []))
-        page_lookup = build_page_lookup(items)
-
-        if parent_page or parent_path:
-            parent, _ = resolve_page_from_inventory(
-                app,
-                items,
-                page_ref=parent_page,
-                page_path=parent_path,
-                label="parent page",
-            )
-            items = [page for page in items if page_parent_id(page) == page_id(parent)]
+        with progress_spinner(app, "Fetching pages...") as spinner:
+            pages_payload = backend.list_all_pages(resolved_doc_id, progress_callback=spinner.update)
+            items = list(pages_payload.get("items", []))
             page_lookup = build_page_lookup(items)
 
-        if query:
-            items = filter_pages_by_query(items, query, page_lookup)
+            if parent_page or parent_path:
+                parent, _ = resolve_page_from_inventory(
+                    app,
+                    items,
+                    page_ref=parent_page,
+                    page_path=parent_path,
+                    label="parent page",
+                )
+                items = [page for page in items if page_parent_id(page) == page_id(parent)]
+                page_lookup = build_page_lookup(items)
 
-        if limit is not None:
-            items = items[:limit]
+            if query:
+                spinner.update("Filtering pages...")
+                items = filter_pages_by_query(items, query, page_lookup)
+
+            if limit is not None:
+                items = items[:limit]
 
         payload = {"items": items}
         emit(app, payload, render_page_items(items, long_mode=long_mode))
@@ -591,31 +647,33 @@ def pages_find(
 ) -> None:
     backend = require_backend(app)
     resolved_doc_id = resolve_doc_id(app, doc_id)
-    items = backend.list_all_pages(resolved_doc_id).get("items", [])
-    page_lookup = build_page_lookup(items)
-
-    if parent_page or parent_path:
-        parent, _ = resolve_page_from_inventory(
-            app,
-            items,
-            page_ref=parent_page,
-            page_path=parent_path,
-            label="parent page",
-        )
-        items = [page for page in items if page_parent_id(page) == page_id(parent)]
+    with progress_spinner(app, "Fetching pages...") as spinner:
+        items = backend.list_all_pages(resolved_doc_id, progress_callback=spinner.update).get("items", [])
         page_lookup = build_page_lookup(items)
 
-    if mode == "exact":
-        normalized_query = query.casefold()
-        matches = [
-            page
-            for page in items
-            if normalized_query in {page_name(page).casefold(), page_id(page).casefold(), build_page_path(page, page_lookup).casefold()}
-        ]
-    elif mode == "fuzzy":
-        matches = fuzzy_find_pages(items, query, page_lookup)
-    else:
-        matches = filter_pages_by_query(items, query, page_lookup)
+        if parent_page or parent_path:
+            parent, _ = resolve_page_from_inventory(
+                app,
+                items,
+                page_ref=parent_page,
+                page_path=parent_path,
+                label="parent page",
+            )
+            items = [page for page in items if page_parent_id(page) == page_id(parent)]
+            page_lookup = build_page_lookup(items)
+
+        spinner.update(f"Searching pages with mode={mode}...")
+        if mode == "exact":
+            normalized_query = query.casefold()
+            matches = [
+                page
+                for page in items
+                if normalized_query in {page_name(page).casefold(), page_id(page).casefold(), build_page_path(page, page_lookup).casefold()}
+            ]
+        elif mode == "fuzzy":
+            matches = fuzzy_find_pages(items, query, page_lookup)
+        else:
+            matches = filter_pages_by_query(items, query, page_lookup)
 
     matches = matches[:limit]
     payload = {
@@ -635,13 +693,15 @@ def pages_find(
 def pages_use(app: AppContext, page_id_or_name: Optional[str], doc_id: Optional[str], page_path: Optional[str]) -> None:
     backend = require_backend(app)
     resolved_doc_id = resolve_doc_id(app, doc_id)
-    page, page_lookup = resolve_page(
-        app,
-        backend,
-        resolved_doc_id,
-        page_ref=page_id_or_name,
-        page_path=page_path,
-    )
+    with progress_spinner(app, "Resolving page...") as spinner:
+        page, page_lookup = resolve_page(
+            app,
+            backend,
+            resolved_doc_id,
+            page_ref=page_id_or_name,
+            page_path=page_path,
+            progress_callback=spinner.update,
+        )
     resolved_page_id = page_id(page)
     set_selection(app, doc_id=resolved_doc_id, table_id=app.state.current_table_id, page_id=resolved_page_id)
     payload = {
@@ -705,18 +765,20 @@ def pages_create(
 def pages_get(app: AppContext, page_id_or_name: Optional[str], doc_id: Optional[str], page_path: Optional[str]) -> None:
     backend = require_backend(app)
     resolved_doc_id = resolve_doc_id(app, doc_id)
-    page, page_lookup = resolve_page(
-        app,
-        backend,
-        resolved_doc_id,
-        page_ref=page_id_or_name,
-        page_path=page_path,
-    )
-    content = backend.get_page_content(
-        resolved_doc_id,
-        page_id(page),
-        progress_callback=progress_callback_for(app),
-    )
+    with progress_spinner(app, "Resolving page...") as spinner:
+        page, page_lookup = resolve_page(
+            app,
+            backend,
+            resolved_doc_id,
+            page_ref=page_id_or_name,
+            page_path=page_path,
+            progress_callback=spinner.update,
+        )
+        content = backend.get_page_content(
+            resolved_doc_id,
+            page_id(page),
+            progress_callback=spinner.update,
+        )
     emit(app, {"content": content, "page": page_summary(page, page_lookup)}, content)
 
 
@@ -736,18 +798,20 @@ def pages_peek(
 ) -> None:
     backend = require_backend(app)
     resolved_doc_id = resolve_doc_id(app, doc_id)
-    page, page_lookup = resolve_page(
-        app,
-        backend,
-        resolved_doc_id,
-        page_ref=page_id_or_name,
-        page_path=page_path,
-    )
-    content = backend.get_page_content(
-        resolved_doc_id,
-        page_id(page),
-        progress_callback=progress_callback_for(app),
-    )
+    with progress_spinner(app, "Resolving page...") as spinner:
+        page, page_lookup = resolve_page(
+            app,
+            backend,
+            resolved_doc_id,
+            page_ref=page_id_or_name,
+            page_path=page_path,
+            progress_callback=spinner.update,
+        )
+        content = backend.get_page_content(
+            resolved_doc_id,
+            page_id(page),
+            progress_callback=spinner.update,
+        )
     preview = "\n".join(content.splitlines()[:num_lines])
     emit(app, {"content": preview, "page": page_summary(page, page_lookup), "lines": num_lines}, preview)
 
@@ -776,19 +840,21 @@ def pages_export(
 ) -> None:
     backend = require_backend(app)
     resolved_doc_id = resolve_doc_id(app, doc_id)
-    page, page_lookup = resolve_page(
-        app,
-        backend,
-        resolved_doc_id,
-        page_ref=page_id_or_name,
-        page_path=page_path,
-    )
-    content = backend.export_page(
-        resolved_doc_id,
-        page_id(page),
-        output_format=output_format,
-        progress_callback=progress_callback_for(app),
-    )
+    with progress_spinner(app, "Resolving page...") as spinner:
+        page, page_lookup = resolve_page(
+            app,
+            backend,
+            resolved_doc_id,
+            page_ref=page_id_or_name,
+            page_path=page_path,
+            progress_callback=spinner.update,
+        )
+        content = backend.export_page(
+            resolved_doc_id,
+            page_id(page),
+            output_format=output_format,
+            progress_callback=spinner.update,
+        )
 
     payload = {"page": page_summary(page, page_lookup), "format": output_format, "content": content}
     if output_path is not None:
@@ -934,27 +1000,30 @@ def pages_copy_content(
     backend = require_backend(app)
     source_doc_id = resolve_doc_id(app, doc_id)
     resolved_target_doc_id = target_doc_id or source_doc_id
-    source_page, source_lookup = resolve_page(
-        app,
-        backend,
-        source_doc_id,
-        page_ref=source_page_id_or_name,
-        page_path=source_path,
-        label="source page",
-    )
-    target_page, target_lookup = resolve_page(
-        app,
-        backend,
-        resolved_target_doc_id,
-        page_ref=target_page_id_or_name,
-        page_path=target_path,
-        label="target page",
-    )
-    content = backend.get_page_content(
-        source_doc_id,
-        page_id(source_page),
-        progress_callback=progress_callback_for(app),
-    )
+    with progress_spinner(app, "Resolving pages...") as spinner:
+        source_page, source_lookup = resolve_page(
+            app,
+            backend,
+            source_doc_id,
+            page_ref=source_page_id_or_name,
+            page_path=source_path,
+            label="source page",
+            progress_callback=spinner.update,
+        )
+        target_page, target_lookup = resolve_page(
+            app,
+            backend,
+            resolved_target_doc_id,
+            page_ref=target_page_id_or_name,
+            page_path=target_path,
+            label="target page",
+            progress_callback=spinner.update,
+        )
+        content = backend.get_page_content(
+            source_doc_id,
+            page_id(source_page),
+            progress_callback=spinner.update,
+        )
     result = backend.update_page_content(
         resolved_target_doc_id,
         page_id(target_page),

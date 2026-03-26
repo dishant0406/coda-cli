@@ -62,6 +62,19 @@ class SessionStoreTests(unittest.TestCase):
 
 
 class CodaBackendTests(unittest.TestCase):
+    def test_requests_default_to_no_timeout(self) -> None:
+        backend = CodaBackend(api_key="test-key")
+        captured = {}
+
+        def fake_urlopen(request, timeout, context=None):
+            captured["timeout"] = timeout
+            return FakeResponse("{}")
+
+        with mock.patch("coda_cli.utils.coda_backend.urlopen", side_effect=fake_urlopen):
+            backend.list_documents()
+
+        self.assertIsNone(captured["timeout"])
+
     def test_update_page_content_shapes_request(self) -> None:
         backend = CodaBackend(api_key="test-key")
         captured = {}

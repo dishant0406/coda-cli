@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import socket
 import ssl
 import time
 from dataclasses import dataclass
@@ -31,7 +32,7 @@ class CodaBackend:
         self,
         api_key: str,
         api_base_url: str = DEFAULT_API_BASE_URL,
-        timeout: float = 30.0,
+        timeout: Optional[float] = None,
         export_poll_interval: float = 1.0,
         export_max_attempts: int = 10,
     ):
@@ -60,15 +61,24 @@ class CodaBackend:
             query=self._compact_query({"limit": None if next_page_token else limit, "pageToken": next_page_token}),
         )
 
-    def list_all_pages(self, doc_id: str, limit: Optional[int] = None) -> Dict[str, Any]:
+    def list_all_pages(
+        self,
+        doc_id: str,
+        limit: Optional[int] = None,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
         items: list[Dict[str, Any]] = []
         next_page_token: Optional[str] = None
+        page_number = 0
 
         while True:
+            page_number += 1
+            self._report_progress(progress_callback, f"Fetching pages batch {page_number} ({len(items)} loaded)...")
             payload = self.list_pages(doc_id, limit=limit, next_page_token=next_page_token)
             items.extend(payload.get("items", []))
             next_page_token = payload.get("nextPageToken")
             if not next_page_token:
+                self._report_progress(progress_callback, f"Fetched {len(items)} pages.")
                 return {"items": items}
 
     def get_page(self, doc_id: str, page_id_or_name: str) -> Dict[str, Any]:
@@ -399,6 +409,8 @@ class CodaBackend:
                 message = details
 
             raise CodaApiError(message=message, status_code=exc.code, details=details) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise CodaApiError("Timed out waiting for the Coda API response.") from exc
         except URLError as exc:
             raise CodaApiError(f"Failed to reach Coda API: {exc.reason}") from exc
 

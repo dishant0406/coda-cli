@@ -29,6 +29,7 @@ coda-cli --help
 - `CODA_API_KEY` or `API_KEY`
 - `CODA_API_BASE_URL` for overrides or testing
 - `CODA_SESSION_PATH` for a custom session file
+- `CODA_API_TIMEOUT` to opt into a client-side timeout in seconds. By default the CLI does not enforce a request timeout.
 - `NODE_TLS_REJECT_UNAUTHORIZED=0` is honored for self-signed HTTPS endpoints and is the default in this CLI. Set it to `1` to enforce TLS verification.
 
 ## Examples
