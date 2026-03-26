@@ -23,7 +23,7 @@ class AppContext:
 
 def main() -> None:
     try:
-        cli(prog_name="cli-anything-coda")
+        cli()
     except CodaApiError as exc:
         raise click.ClickException(str(exc)) from exc
 
