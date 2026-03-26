@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import difflib
 import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import click
 
@@ -53,6 +54,7 @@ def cli(
     session_path: Optional[Path],
     json_output: bool,
 ) -> None:
+    json_output = json_output or bool(ctx.meta.get("json_output_override"))
     resolved_session_path = session_path or default_session_path()
     store = SessionStore(resolved_session_path)
     state = store.load()
@@ -84,6 +86,32 @@ def emit(app: AppContext, payload: Any, text: Optional[str] = None) -> None:
     click.echo(text)
 
 
+def json_option(command: Callable[..., Any]) -> Callable[..., Any]:
+    return click.option(
+        "--json",
+        "json_output",
+        is_flag=True,
+        expose_value=False,
+        help="Emit JSON output for automation.",
+        callback=_enable_json_output,
+    )(command)
+
+
+def _enable_json_output(ctx: click.Context, param: click.Parameter, value: bool) -> bool:
+    if value:
+        root_ctx = ctx.find_root()
+        root_ctx.meta["json_output_override"] = True
+        app = root_ctx.obj
+        if isinstance(app, AppContext):
+            app.json_output = True
+    return value
+
+
+def emit_progress(app: AppContext, message: str) -> None:
+    if not app.json_output:
+        click.echo(message, err=True)
+
+
 def require_backend(app: AppContext) -> CodaBackend:
     if app.backend is None:
         raise click.ClickException("Missing API key. Pass --api-key or set CODA_API_KEY/API_KEY.")
@@ -102,6 +130,26 @@ def resolve_table_id(app: AppContext, table_id_or_name: Optional[str]) -> str:
     if not resolved:
         raise click.ClickException("A table id is required. Pass it explicitly or select one with `tables use`.")
     return resolved
+
+
+def resolve_required_value(
+    direct_value: Optional[str],
+    option_value: Optional[str],
+    current_value: Optional[str],
+    label: str,
+    *,
+    option_name: str,
+    use_session_hint: Optional[str] = None,
+) -> str:
+    if direct_value and option_value:
+        raise click.ClickException(f"Pass either {label} or {option_name}, not both.")
+
+    resolved = option_value or direct_value or current_value
+    if resolved:
+        return resolved
+
+    hint = f" or select one with `{use_session_hint}`" if use_session_hint else ""
+    raise click.ClickException(f"A {label} is required. Pass it explicitly with {option_name}{hint}.")
 
 
 def parse_json_input(raw: Optional[str], file_path: Optional[Path], label: str) -> Any:
@@ -179,6 +227,258 @@ def render_named_items(items: list[dict[str, Any]], label: str) -> str:
     return "\n".join(lines)
 
 
+def page_name(page: dict[str, Any]) -> str:
+    return str(page.get("name") or page.get("displayName") or "<unnamed>")
+
+
+def page_id(page: dict[str, Any]) -> str:
+    return str(page.get("id") or "<no-id>")
+
+
+def page_parent_id(page: dict[str, Any]) -> Optional[str]:
+    for key in ("parent", "parentPage"):
+        value = page.get(key)
+        if isinstance(value, dict) and value.get("id"):
+            return str(value["id"])
+    for key in ("parentPageId", "parentId"):
+        value = page.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def page_parent_name(page: dict[str, Any]) -> Optional[str]:
+    for key in ("parent", "parentPage"):
+        value = page.get(key)
+        if isinstance(value, dict):
+            name = value.get("name") or value.get("displayName")
+            if name:
+                return str(name)
+    return None
+
+
+def page_author_name(page: dict[str, Any]) -> Optional[str]:
+    for key in ("author", "owner", "createdBy", "updatedBy"):
+        value = page.get(key)
+        if isinstance(value, dict):
+            author = value.get("name") or value.get("email") or value.get("id")
+            if author:
+                return str(author)
+        elif isinstance(value, str) and value:
+            return value
+    return None
+
+
+def page_child_count(page: dict[str, Any]) -> Optional[int]:
+    children = page.get("children")
+    if isinstance(children, list):
+        return len(children)
+    if isinstance(children, dict) and isinstance(children.get("items"), list):
+        return len(children["items"])
+    return None
+
+
+def build_page_lookup(pages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {page_id(item): item for item in pages if item.get("id")}
+
+
+def normalize_page_path(value: str) -> str:
+    return "/".join(segment.strip() for segment in value.split("/") if segment.strip()).casefold()
+
+
+def build_page_path(page: dict[str, Any], page_lookup: dict[str, dict[str, Any]]) -> str:
+    segments: list[str] = []
+    current = page
+    seen: set[str] = set()
+
+    while True:
+        current_id = page_id(current)
+        if current_id in seen:
+            break
+        seen.add(current_id)
+        segments.append(page_name(current))
+
+        parent_id = page_parent_id(current)
+        if parent_id and parent_id in page_lookup:
+            current = page_lookup[parent_id]
+            continue
+
+        parent_name = page_parent_name(current)
+        if parent_name:
+            segments.append(parent_name)
+        break
+
+    return "/".join(reversed(segments))
+
+
+def page_summary(page: dict[str, Any], page_lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "id": page.get("id"),
+        "name": page_name(page),
+        "path": build_page_path(page, page_lookup),
+        "parent_id": page_parent_id(page),
+        "parent_name": page_parent_name(page),
+        "updated_at": page.get("updatedAt"),
+        "author": page_author_name(page),
+        "is_hidden": page.get("isHidden"),
+        "child_count": page_child_count(page),
+    }
+
+
+def render_page_items(items: list[dict[str, Any]], *, long_mode: bool = False) -> str:
+    if not items:
+        return "No pages found."
+
+    page_lookup = build_page_lookup(items)
+    lines = []
+    for item in items:
+        summary = page_summary(item, page_lookup)
+        base = f"{summary['path']} ({summary['id'] or '<no-id>'})"
+        if not long_mode:
+            lines.append(base)
+            continue
+        lines.append(
+            " | ".join(
+                [
+                    base,
+                    f"parent={summary['parent_name'] or '-'}",
+                    f"updated={summary['updated_at'] or '-'}",
+                    f"author={summary['author'] or '-'}",
+                    f"hidden={summary['is_hidden'] if summary['is_hidden'] is not None else '-'}",
+                    f"children={summary['child_count'] if summary['child_count'] is not None else '-'}",
+                ]
+            )
+        )
+    return "\n".join(lines)
+
+
+def render_page_matches(matches: list[dict[str, Any]], label: str) -> str:
+    if not matches:
+        return f"No {label} found."
+    return "\n".join(f"- {match['path']} ({match['id']})" for match in matches)
+
+
+def resolve_page_matches(
+    pages: list[dict[str, Any]],
+    page_ref: Optional[str],
+    page_path: Optional[str],
+    *,
+    label: str,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    page_lookup = build_page_lookup(pages)
+    if page_path:
+        normalized_target = normalize_page_path(page_path)
+        matches = [page for page in pages if normalize_page_path(build_page_path(page, page_lookup)) == normalized_target]
+        return matches, page_lookup
+
+    if not page_ref:
+        return [], page_lookup
+
+    exact_id_matches = [page for page in pages if page_id(page) == page_ref]
+    if exact_id_matches:
+        return exact_id_matches, page_lookup
+
+    if "/" in page_ref:
+        normalized_target = normalize_page_path(page_ref)
+        path_matches = [page for page in pages if normalize_page_path(build_page_path(page, page_lookup)) == normalized_target]
+        if path_matches:
+            return path_matches, page_lookup
+
+    exact_name_matches = [page for page in pages if page_name(page).casefold() == page_ref.casefold()]
+    return exact_name_matches, page_lookup
+
+
+def resolve_page(
+    app: AppContext,
+    backend: CodaBackend,
+    doc_id: str,
+    *,
+    page_ref: Optional[str],
+    page_path: Optional[str],
+    label: str = "page",
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    pages = backend.list_all_pages(doc_id).get("items", [])
+    return resolve_page_from_inventory(
+        app,
+        pages,
+        page_ref=page_ref,
+        page_path=page_path,
+        label=label,
+    )
+
+
+def resolve_page_from_inventory(
+    app: AppContext,
+    pages: list[dict[str, Any]],
+    *,
+    page_ref: Optional[str],
+    page_path: Optional[str],
+    label: str = "page",
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    resolved_ref = resolve_required_value(
+        page_ref,
+        page_path,
+        app.state.current_page_id,
+        label,
+        option_name="--path",
+        use_session_hint="pages use",
+    )
+    matches, page_lookup = resolve_page_matches(
+        pages,
+        None if page_path else resolved_ref,
+        page_path or (resolved_ref if "/" in resolved_ref else None),
+        label=label,
+    )
+
+    if len(matches) == 1:
+        return matches[0], page_lookup
+
+    if len(matches) > 1:
+        rendered = render_page_matches([page_summary(match, page_lookup) for match in matches[:10]], f"{label} matches")
+        raise click.ClickException(
+            f"{label.capitalize()} {resolved_ref!r} is ambiguous. Use an id or --path.\n{rendered}"
+        )
+
+    if resolved_ref == app.state.current_page_id:
+        return {"id": resolved_ref, "name": resolved_ref}, page_lookup
+
+    raise click.ClickException(f"No {label} matched {resolved_ref!r}. Use `pages find` to search the current document.")
+
+
+def filter_pages_by_query(
+    pages: list[dict[str, Any]],
+    query: str,
+    page_lookup: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized_query = query.casefold()
+    matches = []
+    for page in pages:
+        haystacks = [page_name(page), page_id(page), build_page_path(page, page_lookup)]
+        if any(normalized_query in haystack.casefold() for haystack in haystacks):
+            matches.append(page)
+    return matches
+
+
+def fuzzy_find_pages(
+    pages: list[dict[str, Any]],
+    query: str,
+    page_lookup: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    scored: list[tuple[float, dict[str, Any]]] = []
+    normalized_query = query.casefold()
+    for page in pages:
+        candidates = [page_name(page), build_page_path(page, page_lookup), page_id(page)]
+        score = max(difflib.SequenceMatcher(a=normalized_query, b=candidate.casefold()).ratio() for candidate in candidates)
+        if score >= 0.5:
+            scored.append((score, page))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [page for _, page in scored]
+
+
+def progress_callback_for(app: AppContext) -> Callable[[str], None]:
+    return lambda message: emit_progress(app, message)
+
+
 @cli.group()
 def docs() -> None:
     """Document operations."""
@@ -186,6 +486,7 @@ def docs() -> None:
 
 @docs.command("list")
 @click.option("--query", default=None, help="Optional search query.")
+@json_option
 @click.pass_obj
 def docs_list(app: AppContext, query: Optional[str]) -> None:
     backend = require_backend(app)
@@ -194,11 +495,14 @@ def docs_list(app: AppContext, query: Optional[str]) -> None:
 
 
 @docs.command("use")
-@click.argument("doc_id")
+@click.argument("doc_ref", required=False)
+@click.option("--doc-id", default=None, help="Document id. Use this form for ids that begin with '-'.")
+@json_option
 @click.pass_obj
-def docs_use(app: AppContext, doc_id: str) -> None:
-    set_selection(app, doc_id=doc_id, table_id=None, page_id=None)
-    emit(app, {"current_doc_id": doc_id}, f"Current document: {doc_id}")
+def docs_use(app: AppContext, doc_ref: Optional[str], doc_id: Optional[str]) -> None:
+    resolved_doc_id = resolve_required_value(doc_ref, doc_id, None, "document id", option_name="--doc-id")
+    set_selection(app, doc_id=resolved_doc_id, table_id=None, page_id=None)
+    emit(app, {"current_doc_id": resolved_doc_id}, f"Current document: {resolved_doc_id}")
 
 
 @cli.group()
@@ -210,72 +514,299 @@ def pages() -> None:
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
 @click.option("--limit", type=int, default=None)
 @click.option("--next-page-token", default=None)
+@click.option("--query", default=None, help="Filter pages by id, name, or path.")
+@click.option("--parent-page", default=None, help="Only include direct children of this parent page id or name.")
+@click.option("--parent-path", default=None, help="Only include direct children of this parent page path.")
+@click.option("--all", "all_pages", is_flag=True, default=False, help="Fetch every page in the document before rendering.")
+@click.option("--long", "long_mode", is_flag=True, default=False, help="Show parent/path metadata in human-readable output.")
+@json_option
 @click.pass_obj
-def pages_list(app: AppContext, doc_id: Optional[str], limit: Optional[int], next_page_token: Optional[str]) -> None:
+def pages_list(
+    app: AppContext,
+    doc_id: Optional[str],
+    limit: Optional[int],
+    next_page_token: Optional[str],
+    query: Optional[str],
+    parent_page: Optional[str],
+    parent_path: Optional[str],
+    all_pages: bool,
+    long_mode: bool,
+) -> None:
     backend = require_backend(app)
-    payload = backend.list_pages(resolve_doc_id(app, doc_id), limit=limit, next_page_token=next_page_token)
-    emit(app, payload, render_named_items(payload.get("items", []), "pages"))
+    resolved_doc_id = resolve_doc_id(app, doc_id)
+    use_inventory = bool(query or parent_page or parent_path or all_pages or long_mode)
+
+    if use_inventory:
+        pages_payload = backend.list_all_pages(resolved_doc_id)
+        items = list(pages_payload.get("items", []))
+        page_lookup = build_page_lookup(items)
+
+        if parent_page or parent_path:
+            parent, _ = resolve_page_from_inventory(
+                app,
+                items,
+                page_ref=parent_page,
+                page_path=parent_path,
+                label="parent page",
+            )
+            items = [page for page in items if page_parent_id(page) == page_id(parent)]
+            page_lookup = build_page_lookup(items)
+
+        if query:
+            items = filter_pages_by_query(items, query, page_lookup)
+
+        if limit is not None:
+            items = items[:limit]
+
+        payload = {"items": items}
+        emit(app, payload, render_page_items(items, long_mode=long_mode))
+        return
+
+    payload = backend.list_pages(resolved_doc_id, limit=limit, next_page_token=next_page_token)
+    emit(app, payload, render_page_items(payload.get("items", []), long_mode=long_mode))
+
+
+@pages.command("find")
+@click.argument("query")
+@click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
+@click.option(
+    "--mode",
+    type=click.Choice(["contains", "exact", "fuzzy"], case_sensitive=False),
+    default="contains",
+    show_default=True,
+)
+@click.option("--limit", type=int, default=20, show_default=True)
+@click.option("--parent-page", default=None, help="Optional parent page id or name scope.")
+@click.option("--parent-path", default=None, help="Optional parent page path scope.")
+@json_option
+@click.pass_obj
+def pages_find(
+    app: AppContext,
+    query: str,
+    doc_id: Optional[str],
+    mode: str,
+    limit: int,
+    parent_page: Optional[str],
+    parent_path: Optional[str],
+) -> None:
+    backend = require_backend(app)
+    resolved_doc_id = resolve_doc_id(app, doc_id)
+    items = backend.list_all_pages(resolved_doc_id).get("items", [])
+    page_lookup = build_page_lookup(items)
+
+    if parent_page or parent_path:
+        parent, _ = resolve_page_from_inventory(
+            app,
+            items,
+            page_ref=parent_page,
+            page_path=parent_path,
+            label="parent page",
+        )
+        items = [page for page in items if page_parent_id(page) == page_id(parent)]
+        page_lookup = build_page_lookup(items)
+
+    if mode == "exact":
+        normalized_query = query.casefold()
+        matches = [
+            page
+            for page in items
+            if normalized_query in {page_name(page).casefold(), page_id(page).casefold(), build_page_path(page, page_lookup).casefold()}
+        ]
+    elif mode == "fuzzy":
+        matches = fuzzy_find_pages(items, query, page_lookup)
+    else:
+        matches = filter_pages_by_query(items, query, page_lookup)
+
+    matches = matches[:limit]
+    payload = {
+        "query": query,
+        "mode": mode,
+        "items": [page_summary(page, page_lookup) for page in matches],
+    }
+    emit(app, payload, render_page_matches(payload["items"], "matching pages"))
 
 
 @pages.command("use")
-@click.argument("page_id")
+@click.argument("page_id_or_name", required=False)
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
+@click.option("--path", "page_path", default=None, help="Full page path, for example Team/Project/Page.")
+@json_option
 @click.pass_obj
-def pages_use(app: AppContext, page_id: str, doc_id: Optional[str]) -> None:
+def pages_use(app: AppContext, page_id_or_name: Optional[str], doc_id: Optional[str], page_path: Optional[str]) -> None:
+    backend = require_backend(app)
     resolved_doc_id = resolve_doc_id(app, doc_id)
-    set_selection(app, doc_id=resolved_doc_id, table_id=app.state.current_table_id, page_id=page_id)
-    emit(app, {"current_doc_id": resolved_doc_id, "current_page_id": page_id}, f"Current page: {page_id}")
+    page, page_lookup = resolve_page(
+        app,
+        backend,
+        resolved_doc_id,
+        page_ref=page_id_or_name,
+        page_path=page_path,
+    )
+    resolved_page_id = page_id(page)
+    set_selection(app, doc_id=resolved_doc_id, table_id=app.state.current_table_id, page_id=resolved_page_id)
+    payload = {
+        "current_doc_id": resolved_doc_id,
+        "current_page_id": resolved_page_id,
+        "current_page": page_summary(page, page_lookup),
+    }
+    emit(app, payload, f"Current page: {payload['current_page']['path']} ({resolved_page_id})")
 
 
 @pages.command("create")
 @click.argument("name")
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
-@click.option("--parent-page-id", default=None)
+@click.option("--parent-page-id", default=None, help="Parent page id or name.")
+@click.option("--parent-path", default=None, help="Parent page path for disambiguation.")
 @click.option("--content", default=None, help="Inline markdown content.")
 @click.option("--file", "content_file", type=click.Path(path_type=Path, exists=True, dir_okay=False), default=None)
+@json_option
 @click.pass_obj
 def pages_create(
     app: AppContext,
     name: str,
     doc_id: Optional[str],
     parent_page_id: Optional[str],
+    parent_path: Optional[str],
     content: Optional[str],
     content_file: Optional[Path],
 ) -> None:
     backend = require_backend(app)
+    resolved_doc_id = resolve_doc_id(app, doc_id)
     if content is not None or content_file is not None:
         content_value = parse_text_input(content, content_file, "page content")
     else:
         content_value = None
-    payload = backend.create_page(resolve_doc_id(app, doc_id), name, content=content_value, parent_page_id=parent_page_id)
+    resolved_parent_page_id = None
+    if parent_page_id or parent_path:
+        parent_page, _ = resolve_page(
+            app,
+            backend,
+            resolved_doc_id,
+            page_ref=parent_page_id,
+            page_path=parent_path,
+            label="parent page",
+        )
+        resolved_parent_page_id = page_id(parent_page)
+    payload = backend.create_page(
+        resolved_doc_id,
+        name,
+        content=content_value,
+        parent_page_id=resolved_parent_page_id,
+    )
     emit(app, payload)
 
 
 @pages.command("get")
-@click.argument("page_id_or_name")
+@click.argument("page_id_or_name", required=False)
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
+@click.option("--path", "page_path", default=None, help="Full page path, for example Team/Project/Page.")
+@json_option
 @click.pass_obj
-def pages_get(app: AppContext, page_id_or_name: str, doc_id: Optional[str]) -> None:
+def pages_get(app: AppContext, page_id_or_name: Optional[str], doc_id: Optional[str], page_path: Optional[str]) -> None:
     backend = require_backend(app)
-    content = backend.get_page_content(resolve_doc_id(app, doc_id), page_id_or_name)
-    emit(app, {"content": content, "page": page_id_or_name}, content)
+    resolved_doc_id = resolve_doc_id(app, doc_id)
+    page, page_lookup = resolve_page(
+        app,
+        backend,
+        resolved_doc_id,
+        page_ref=page_id_or_name,
+        page_path=page_path,
+    )
+    content = backend.get_page_content(
+        resolved_doc_id,
+        page_id(page),
+        progress_callback=progress_callback_for(app),
+    )
+    emit(app, {"content": content, "page": page_summary(page, page_lookup)}, content)
 
 
 @pages.command("peek")
-@click.argument("page_id_or_name")
+@click.argument("page_id_or_name", required=False)
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
+@click.option("--path", "page_path", default=None, help="Full page path, for example Team/Project/Page.")
 @click.option("--lines", "num_lines", type=int, default=30, show_default=True)
+@json_option
 @click.pass_obj
-def pages_peek(app: AppContext, page_id_or_name: str, doc_id: Optional[str], num_lines: int) -> None:
+def pages_peek(
+    app: AppContext,
+    page_id_or_name: Optional[str],
+    doc_id: Optional[str],
+    page_path: Optional[str],
+    num_lines: int,
+) -> None:
     backend = require_backend(app)
-    content = backend.get_page_content(resolve_doc_id(app, doc_id), page_id_or_name)
+    resolved_doc_id = resolve_doc_id(app, doc_id)
+    page, page_lookup = resolve_page(
+        app,
+        backend,
+        resolved_doc_id,
+        page_ref=page_id_or_name,
+        page_path=page_path,
+    )
+    content = backend.get_page_content(
+        resolved_doc_id,
+        page_id(page),
+        progress_callback=progress_callback_for(app),
+    )
     preview = "\n".join(content.splitlines()[:num_lines])
-    emit(app, {"content": preview, "page": page_id_or_name, "lines": num_lines}, preview)
+    emit(app, {"content": preview, "page": page_summary(page, page_lookup), "lines": num_lines}, preview)
+
+
+@pages.command("export")
+@click.argument("page_id_or_name", required=False)
+@click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
+@click.option("--path", "page_path", default=None, help="Full page path, for example Team/Project/Page.")
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["markdown", "html"], case_sensitive=False),
+    default="markdown",
+    show_default=True,
+)
+@click.option("--output", "output_path", type=click.Path(path_type=Path, dir_okay=False), default=None)
+@json_option
+@click.pass_obj
+def pages_export(
+    app: AppContext,
+    page_id_or_name: Optional[str],
+    doc_id: Optional[str],
+    page_path: Optional[str],
+    output_format: str,
+    output_path: Optional[Path],
+) -> None:
+    backend = require_backend(app)
+    resolved_doc_id = resolve_doc_id(app, doc_id)
+    page, page_lookup = resolve_page(
+        app,
+        backend,
+        resolved_doc_id,
+        page_ref=page_id_or_name,
+        page_path=page_path,
+    )
+    content = backend.export_page(
+        resolved_doc_id,
+        page_id(page),
+        output_format=output_format,
+        progress_callback=progress_callback_for(app),
+    )
+
+    payload = {"page": page_summary(page, page_lookup), "format": output_format, "content": content}
+    if output_path is not None:
+        try:
+            output_path.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            raise click.ClickException(f"Failed to write export file: {exc}") from exc
+        payload["output"] = str(output_path)
+        emit(app, payload, f"Wrote {output_format} export to {output_path}")
+        return
+
+    emit(app, payload, content)
 
 
 @pages.command("update-content")
-@click.argument("page_id_or_name")
+@click.argument("page_id_or_name", required=False)
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
+@click.option("--path", "page_path", default=None, help="Full page path, for example Team/Project/Page.")
 @click.option(
     "--mode",
     "insertion_mode",
@@ -286,21 +817,31 @@ def pages_peek(app: AppContext, page_id_or_name: str, doc_id: Optional[str], num
 @click.option("--element-id", default=None, help="Optional element id for relative content edits.")
 @click.option("--content", default=None, help="Inline markdown content.")
 @click.option("--file", "content_file", type=click.Path(path_type=Path, exists=True, dir_okay=False), default=None)
+@json_option
 @click.pass_obj
 def pages_update_content(
     app: AppContext,
-    page_id_or_name: str,
+    page_id_or_name: Optional[str],
     doc_id: Optional[str],
+    page_path: Optional[str],
     insertion_mode: str,
     element_id: Optional[str],
     content: Optional[str],
     content_file: Optional[Path],
 ) -> None:
     backend = require_backend(app)
+    resolved_doc_id = resolve_doc_id(app, doc_id)
+    page, _ = resolve_page(
+        app,
+        backend,
+        resolved_doc_id,
+        page_ref=page_id_or_name,
+        page_path=page_path,
+    )
     content_value = parse_text_input(content, content_file, "page content")
     payload = backend.update_page_content(
-        resolve_doc_id(app, doc_id),
-        page_id_or_name,
+        resolved_doc_id,
+        page_id(page),
         content_value,
         insertion_mode=insertion_mode,
         element_id=element_id,
@@ -309,32 +850,66 @@ def pages_update_content(
 
 
 @pages.command("duplicate")
-@click.argument("page_id_or_name")
+@click.argument("page_id_or_name", required=False)
 @click.argument("new_name")
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
+@click.option("--path", "page_path", default=None, help="Full page path, for example Team/Project/Page.")
+@json_option
 @click.pass_obj
-def pages_duplicate(app: AppContext, page_id_or_name: str, new_name: str, doc_id: Optional[str]) -> None:
+def pages_duplicate(
+    app: AppContext,
+    page_id_or_name: Optional[str],
+    new_name: str,
+    doc_id: Optional[str],
+    page_path: Optional[str],
+) -> None:
     backend = require_backend(app)
-    payload = backend.duplicate_page(resolve_doc_id(app, doc_id), page_id_or_name, new_name)
+    resolved_doc_id = resolve_doc_id(app, doc_id)
+    page, _ = resolve_page(
+        app,
+        backend,
+        resolved_doc_id,
+        page_ref=page_id_or_name,
+        page_path=page_path,
+    )
+    payload = backend.duplicate_page(resolved_doc_id, page_id(page), new_name)
     emit(app, payload)
 
 
 @pages.command("rename")
-@click.argument("page_id_or_name")
+@click.argument("page_id_or_name", required=False)
 @click.argument("new_name")
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
+@click.option("--path", "page_path", default=None, help="Full page path, for example Team/Project/Page.")
+@json_option
 @click.pass_obj
-def pages_rename(app: AppContext, page_id_or_name: str, new_name: str, doc_id: Optional[str]) -> None:
+def pages_rename(
+    app: AppContext,
+    page_id_or_name: Optional[str],
+    new_name: str,
+    doc_id: Optional[str],
+    page_path: Optional[str],
+) -> None:
     backend = require_backend(app)
-    payload = backend.rename_page(resolve_doc_id(app, doc_id), page_id_or_name, new_name)
+    resolved_doc_id = resolve_doc_id(app, doc_id)
+    page, _ = resolve_page(
+        app,
+        backend,
+        resolved_doc_id,
+        page_ref=page_id_or_name,
+        page_path=page_path,
+    )
+    payload = backend.rename_page(resolved_doc_id, page_id(page), new_name)
     emit(app, payload)
 
 
 @pages.command("copy-content")
-@click.argument("source_page_id_or_name")
-@click.argument("target_page_id_or_name")
+@click.argument("source_page_id_or_name", required=False)
+@click.argument("target_page_id_or_name", required=False)
 @click.option("--doc-id", default=None, help="Source document id. Falls back to the current session doc.")
 @click.option("--target-doc-id", default=None, help="Target document id. Defaults to the source doc.")
+@click.option("--source-path", default=None, help="Full source page path.")
+@click.option("--target-path", default=None, help="Full target page path.")
 @click.option(
     "--mode",
     "insertion_mode",
@@ -343,23 +918,46 @@ def pages_rename(app: AppContext, page_id_or_name: str, new_name: str, doc_id: O
     show_default=True,
 )
 @click.option("--target-element-id", default=None, help="Optional target element id for relative content edits.")
+@json_option
 @click.pass_obj
 def pages_copy_content(
     app: AppContext,
-    source_page_id_or_name: str,
-    target_page_id_or_name: str,
+    source_page_id_or_name: Optional[str],
+    target_page_id_or_name: Optional[str],
     doc_id: Optional[str],
     target_doc_id: Optional[str],
+    source_path: Optional[str],
+    target_path: Optional[str],
     insertion_mode: str,
     target_element_id: Optional[str],
 ) -> None:
     backend = require_backend(app)
     source_doc_id = resolve_doc_id(app, doc_id)
     resolved_target_doc_id = target_doc_id or source_doc_id
-    content = backend.get_page_content(source_doc_id, source_page_id_or_name)
+    source_page, source_lookup = resolve_page(
+        app,
+        backend,
+        source_doc_id,
+        page_ref=source_page_id_or_name,
+        page_path=source_path,
+        label="source page",
+    )
+    target_page, target_lookup = resolve_page(
+        app,
+        backend,
+        resolved_target_doc_id,
+        page_ref=target_page_id_or_name,
+        page_path=target_path,
+        label="target page",
+    )
+    content = backend.get_page_content(
+        source_doc_id,
+        page_id(source_page),
+        progress_callback=progress_callback_for(app),
+    )
     result = backend.update_page_content(
         resolved_target_doc_id,
-        target_page_id_or_name,
+        page_id(target_page),
         content,
         insertion_mode=insertion_mode,
         element_id=target_element_id,
@@ -368,9 +966,9 @@ def pages_copy_content(
         app,
         {
             "source_doc_id": source_doc_id,
-            "source_page_id_or_name": source_page_id_or_name,
+            "source_page": page_summary(source_page, source_lookup),
             "target_doc_id": resolved_target_doc_id,
-            "target_page_id_or_name": target_page_id_or_name,
+            "target_page": page_summary(target_page, target_lookup),
             "result": result,
         },
     )
@@ -387,6 +985,7 @@ def tables() -> None:
 @click.option("--next-page-token", default=None)
 @click.option("--sort-by", type=click.Choice(["createdAt", "natural", "updatedAt"], case_sensitive=False), default=None)
 @click.option("--table-type", "table_types", multiple=True, type=click.Choice(["table", "view"], case_sensitive=False))
+@json_option
 @click.pass_obj
 def tables_list(
     app: AppContext,
@@ -410,6 +1009,7 @@ def tables_list(
 @tables.command("use")
 @click.argument("table_id")
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
+@json_option
 @click.pass_obj
 def tables_use(app: AppContext, table_id: str, doc_id: Optional[str]) -> None:
     resolved_doc_id = resolve_doc_id(app, doc_id)
@@ -423,6 +1023,7 @@ def tables_use(app: AppContext, table_id: str, doc_id: Optional[str]) -> None:
 @click.option("--limit", type=int, default=None)
 @click.option("--next-page-token", default=None)
 @click.option("--visible-only/--all-columns", default=None)
+@json_option
 @click.pass_obj
 def tables_columns(
     app: AppContext,
@@ -448,6 +1049,7 @@ def tables_columns(
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
 @click.option("--visible-only/--all-columns", default=None)
 @click.option("--updated-layouts", is_flag=True, default=False, help="Request updated detail/form layout labels.")
+@json_option
 @click.pass_obj
 def tables_schema(
     app: AppContext,
@@ -494,6 +1096,7 @@ def rows() -> None:
 @click.option("--limit", type=int, default=None)
 @click.option("--next-page-token", default=None)
 @click.option("--sync-token", default=None)
+@json_option
 @click.pass_obj
 def rows_list(
     app: AppContext,
@@ -530,6 +1133,7 @@ def rows_list(
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
 @click.option("--use-column-names/--use-column-ids", default=True)
 @click.option("--value-format", type=click.Choice(["simple", "simpleWithArrays", "rich"], case_sensitive=False), default="rich")
+@json_option
 @click.pass_obj
 def rows_get(
     app: AppContext,
@@ -558,6 +1162,7 @@ def rows_get(
 @click.option("--key-columns", default=None, help="Inline JSON array of key columns.")
 @click.option("--key-columns-file", type=click.Path(path_type=Path, exists=True, dir_okay=False), default=None)
 @click.option("--disable-parsing", is_flag=True, default=False)
+@json_option
 @click.pass_obj
 def rows_upsert(
     app: AppContext,
@@ -591,6 +1196,7 @@ def rows_upsert(
 @click.option("--cells", default=None, help="Inline JSON array of cell edits.")
 @click.option("--cells-file", type=click.Path(path_type=Path, exists=True, dir_okay=False), default=None)
 @click.option("--disable-parsing", is_flag=True, default=False)
+@json_option
 @click.pass_obj
 def rows_update(
     app: AppContext,
@@ -623,6 +1229,7 @@ def rows_update(
     help='Repeatable field assignment in the form COLUMN=JSON_VALUE, for example --field Status="Done".',
 )
 @click.option("--disable-parsing", is_flag=True, default=False)
+@json_option
 @click.pass_obj
 def rows_update_fields(
     app: AppContext,
@@ -659,6 +1266,7 @@ def rows_update_fields(
     help="Optional repeatable key column for upsert matching.",
 )
 @click.option("--disable-parsing", is_flag=True, default=False)
+@json_option
 @click.pass_obj
 def rows_upsert_one(
     app: AppContext,
@@ -684,6 +1292,7 @@ def rows_upsert_one(
 @click.argument("row_id_or_name")
 @click.option("--table-id", "table_id_or_name", default=None, help="Table id or name. Falls back to the current session table.")
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
+@json_option
 @click.pass_obj
 def rows_delete(app: AppContext, table_id_or_name: Optional[str], row_id_or_name: str, doc_id: Optional[str]) -> None:
     backend = require_backend(app)
@@ -696,6 +1305,7 @@ def rows_delete(app: AppContext, table_id_or_name: Optional[str], row_id_or_name
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
 @click.option("--row-ids", default=None, help="Inline JSON array of row ids.")
 @click.option("--row-ids-file", type=click.Path(path_type=Path, exists=True, dir_okay=False), default=None)
+@json_option
 @click.pass_obj
 def rows_delete_many(
     app: AppContext,
@@ -718,6 +1328,7 @@ def rows_delete_many(
 @click.argument("column_id_or_name")
 @click.option("--table-id", "table_id_or_name", default=None, help="Table id or name. Falls back to the current session table.")
 @click.option("--doc-id", default=None, help="Document id. Falls back to the current session doc.")
+@json_option
 @click.pass_obj
 def rows_push_button(
     app: AppContext,
@@ -744,6 +1355,7 @@ def links() -> None:
 @links.command("resolve")
 @click.argument("url")
 @click.option("--degrade-gracefully", is_flag=True, default=False)
+@json_option
 @click.pass_obj
 def links_resolve(app: AppContext, url: str, degrade_gracefully: bool) -> None:
     backend = require_backend(app)
@@ -757,29 +1369,64 @@ def session() -> None:
 
 
 @session.command("show")
+@json_option
 @click.pass_obj
 def session_show(app: AppContext) -> None:
-    emit(
-        app,
-        {
-            "session_path": str(app.session_path),
-            "api_base_url": app.state.api_base_url,
-            "current_doc_id": app.state.current_doc_id,
-            "current_table_id": app.state.current_table_id,
-            "current_page_id": app.state.current_page_id,
-            "history_depth": len(app.state.history),
-            "future_depth": len(app.state.future),
-        },
-    )
+    payload: dict[str, Any] = {
+        "session_path": str(app.session_path),
+        "api_base_url": app.state.api_base_url,
+        "current_doc_id": app.state.current_doc_id,
+        "current_table_id": app.state.current_table_id,
+        "current_page_id": app.state.current_page_id,
+        "history_depth": len(app.state.history),
+        "future_depth": len(app.state.future),
+    }
+
+    if app.backend is not None and app.state.current_doc_id:
+        try:
+            document = app.backend.get_document(app.state.current_doc_id)
+            payload["current_doc"] = {"id": document.get("id"), "name": document.get("name")}
+        except CodaApiError as exc:
+            payload["current_doc_error"] = str(exc)
+
+        if app.state.current_page_id:
+            try:
+                pages_payload = app.backend.list_all_pages(app.state.current_doc_id)
+                page_lookup = build_page_lookup(pages_payload.get("items", []))
+                current_page = page_lookup.get(app.state.current_page_id)
+                if current_page is not None:
+                    payload["current_page"] = page_summary(current_page, page_lookup)
+            except CodaApiError as exc:
+                payload["current_page_error"] = str(exc)
+
+    if app.backend is not None and app.state.current_doc_id and app.state.current_table_id:
+        try:
+            table = app.backend.get_table(app.state.current_doc_id, app.state.current_table_id)
+            payload["current_table"] = {"id": table.get("id"), "name": table.get("name")}
+        except CodaApiError as exc:
+            payload["current_table_error"] = str(exc)
+
+    lines = [
+        f"Session: {payload['session_path']}",
+        f"API base URL: {payload['api_base_url']}",
+        f"Current doc: {(payload.get('current_doc') or {}).get('name') or payload['current_doc_id'] or '-'}",
+        f"Current table: {(payload.get('current_table') or {}).get('name') or payload['current_table_id'] or '-'}",
+        f"Current page: {(payload.get('current_page') or {}).get('path') or payload['current_page_id'] or '-'}",
+        f"History depth: {payload['history_depth']}",
+        f"Future depth: {payload['future_depth']}",
+    ]
+    emit(app, payload, "\n".join(lines))
 
 
 @session.command("last")
+@json_option
 @click.pass_obj
 def session_last(app: AppContext) -> None:
     emit(app, {"last_result": app.state.last_result})
 
 
 @session.command("clear")
+@json_option
 @click.pass_obj
 def session_clear(app: AppContext) -> None:
     set_selection(app, doc_id=None, table_id=None, page_id=None)
@@ -787,6 +1434,7 @@ def session_clear(app: AppContext) -> None:
 
 
 @session.command("undo")
+@json_option
 @click.pass_obj
 def session_undo(app: AppContext) -> None:
     if not app.store.undo(app.state):
@@ -795,6 +1443,7 @@ def session_undo(app: AppContext) -> None:
 
 
 @session.command("redo")
+@json_option
 @click.pass_obj
 def session_redo(app: AppContext) -> None:
     if not app.store.redo(app.state):

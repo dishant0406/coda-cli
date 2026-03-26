@@ -34,8 +34,12 @@ coda-cli --help
 ## Examples
 
 ```bash
-coda-cli docs list
-coda-cli docs use doc-xyz
+coda-cli docs list --json
+coda-cli docs use --doc-id doc-xyz
+coda-cli pages list --query sdk --long
+coda-cli pages find "GrowwBot SDK" --mode exact
+coda-cli pages get --path "Web Team/GR-1/GrowwBot SDK"
+coda-cli pages export --path "Web Team/GR-1/GrowwBot SDK" --output growwbot-sdk.md
 coda-cli tables schema
 coda-cli rows update-fields i-row123 --field 'Status="Done"' --field 'Points=3'
 coda-cli pages copy-content source-page target-page --mode append

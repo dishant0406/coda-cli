@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import tempfile
 import unittest
@@ -10,12 +11,15 @@ from click.testing import CliRunner
 
 from coda_cli.coda_cli import cli
 from coda_cli.core.state import SessionState, SessionStore
-from coda_cli.utils.coda_backend import CodaBackend
+from coda_cli.utils.coda_backend import CodaApiError, CodaBackend
 
 
 class FakeResponse:
-    def __init__(self, payload: str):
-        self.payload = payload.encode("utf-8")
+    def __init__(self, payload: bytes | str, headers: dict[str, str] | None = None):
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        self.payload = payload
+        self.headers = headers or {}
 
     def read(self) -> bytes:
         return self.payload
@@ -82,7 +86,7 @@ class CodaBackendTests(unittest.TestCase):
             FakeResponse(json.dumps({"id": "export-1"})),
             FakeResponse(json.dumps({"status": "inProgress"})),
             FakeResponse(json.dumps({"status": "complete", "downloadLink": "http://download.local/file.md"})),
-            FakeResponse("# Heading\nBody"),
+            FakeResponse(gzip.compress(b"# Heading\nBody"), headers={"Content-Encoding": "gzip"}),
         ]
 
         with mock.patch("coda_cli.utils.coda_backend.urlopen", side_effect=responses), mock.patch(
@@ -92,8 +96,94 @@ class CodaBackendTests(unittest.TestCase):
 
         self.assertEqual(content, "# Heading\nBody")
 
+    def test_get_page_content_raises_clean_decode_error(self) -> None:
+        backend = CodaBackend(api_key="test-key", export_poll_interval=0, export_max_attempts=1)
+        responses = [
+            FakeResponse(json.dumps({"id": "export-1"})),
+            FakeResponse(json.dumps({"status": "complete", "downloadLink": "http://download.local/file.md"})),
+            FakeResponse(b"\xff\xfe\xfd"),
+        ]
+
+        with mock.patch("coda_cli.utils.coda_backend.urlopen", side_effect=responses):
+            with self.assertRaises(CodaApiError) as context:
+                backend.get_page_content("doc-1", "page-1")
+
+        self.assertIn("Failed to decode exported page markdown as UTF-8 text.", str(context.exception))
+
 
 class CliWorkflowTests(unittest.TestCase):
+    def test_docs_list_accepts_json_after_subcommand(self) -> None:
+        runner = CliRunner()
+        backend = mock.Mock()
+        backend.list_documents.return_value = {"items": [{"id": "doc-1", "name": "Example"}]}
+
+        with runner.isolated_filesystem():
+            session_path = Path("session.json")
+            env = {"CODA_API_KEY": "test-key", "CODA_SESSION_PATH": str(session_path)}
+            with mock.patch("coda_cli.coda_cli.CodaBackend", return_value=backend):
+                result = runner.invoke(cli, ["docs", "list", "--json"], env=env)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        payload = json.loads(result.output)
+        self.assertEqual(payload["items"][0]["id"], "doc-1")
+
+    def test_docs_use_accepts_dash_prefixed_ids_via_option(self) -> None:
+        runner = CliRunner()
+
+        with runner.isolated_filesystem():
+            session_path = Path("session.json")
+            env = {"CODA_SESSION_PATH": str(session_path)}
+            result = runner.invoke(cli, ["docs", "use", "--doc-id", "-LNk7c4rKF", "--json"], env=env)
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            payload = json.loads(result.output)
+            self.assertEqual(payload["current_doc_id"], "-LNk7c4rKF")
+
+            saved = json.loads(session_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["current_doc_id"], "-LNk7c4rKF")
+
+    def test_pages_find_filters_across_paths(self) -> None:
+        runner = CliRunner()
+        backend = mock.Mock()
+        backend.list_all_pages.return_value = {
+            "items": [
+                {"id": "page-1", "name": "Engineering"},
+                {"id": "page-2", "name": "GrowwBot SDK", "parent": {"id": "page-1", "name": "Engineering"}},
+            ]
+        }
+
+        with runner.isolated_filesystem():
+            session_path = Path("session.json")
+            env = {"CODA_API_KEY": "test-key", "CODA_SESSION_PATH": str(session_path)}
+            SessionStore(session_path).save(SessionState(current_doc_id="doc-1"))
+            with mock.patch("coda_cli.coda_cli.CodaBackend", return_value=backend):
+                result = runner.invoke(cli, ["pages", "find", "growwbot", "--json"], env=env)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        payload = json.loads(result.output)
+        self.assertEqual(payload["items"][0]["path"], "Engineering/GrowwBot SDK")
+
+    def test_pages_get_rejects_ambiguous_page_names(self) -> None:
+        runner = CliRunner()
+        backend = mock.Mock()
+        backend.list_all_pages.return_value = {
+            "items": [
+                {"id": "page-1", "name": "Watchlist", "parent": {"id": "root-1", "name": "Web Team"}},
+                {"id": "page-2", "name": "Watchlist", "parent": {"id": "root-2", "name": "Mobile Team"}},
+            ]
+        }
+
+        with runner.isolated_filesystem():
+            session_path = Path("session.json")
+            env = {"CODA_API_KEY": "test-key", "CODA_SESSION_PATH": str(session_path)}
+            SessionStore(session_path).save(SessionState(current_doc_id="doc-1"))
+            with mock.patch("coda_cli.coda_cli.CodaBackend", return_value=backend):
+                result = runner.invoke(cli, ["pages", "get", "Watchlist"], env=env)
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("ambiguous", result.output.casefold())
+        self.assertIn("Web Team/Watchlist", result.output)
+
     def test_rows_update_fields_builds_cells_from_field_flags(self) -> None:
         runner = CliRunner()
         backend = mock.Mock()

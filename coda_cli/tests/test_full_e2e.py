@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import shutil
@@ -33,12 +34,29 @@ class StubCodaHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _send_bytes(self, payload: bytes, status: int = 200, *, content_type: str = "application/octet-stream", headers: dict[str, str] | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(payload)
+
     def log_message(self, format: str, *args) -> None:
         return
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path.startswith("/docs?query=example"):
             self._send_json({"items": [{"id": "doc-1", "name": "Example Doc"}]})
+            return
+
+        if self.path == "/docs/doc-1":
+            self._send_json({"id": "doc-1", "name": "Example Doc"})
+            return
+
+        if self.path == "/docs/doc-1/pages":
+            self._send_json({"items": [{"id": "page-1", "name": "Example Page"}]})
             return
 
         if self.path == "/docs/doc-1/tables":
@@ -59,7 +77,11 @@ class StubCodaHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/download/page-1.md":
-            self._send_text("# Example Page\nBody")
+            self._send_bytes(
+                gzip.compress(b"# Example Page\nBody"),
+                content_type="text/markdown",
+                headers={"Content-Encoding": "gzip"},
+            )
             return
 
         self.send_error(404)
@@ -120,7 +142,7 @@ class FullE2ETests(unittest.TestCase):
         )
 
     def test_docs_list_json(self) -> None:
-        result = self.run_cli("--json", "docs", "list", "--query", "example")
+        result = self.run_cli("docs", "list", "--query", "example", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["items"][0]["id"], "doc-1")

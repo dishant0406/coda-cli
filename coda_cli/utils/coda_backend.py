@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import ssl
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, quote
 from urllib.request import Request, urlopen
@@ -44,6 +45,9 @@ class CodaBackend:
     def list_documents(self, query: Optional[str] = None) -> Dict[str, Any]:
         return self._request("GET", "/docs", query=self._compact_query({"query": query}))
 
+    def get_document(self, doc_id: str) -> Dict[str, Any]:
+        return self._request("GET", f"/docs/{self._segment(doc_id)}")
+
     def list_pages(
         self,
         doc_id: str,
@@ -55,6 +59,20 @@ class CodaBackend:
             f"/docs/{self._segment(doc_id)}/pages",
             query=self._compact_query({"limit": None if next_page_token else limit, "pageToken": next_page_token}),
         )
+
+    def list_all_pages(self, doc_id: str, limit: Optional[int] = None) -> Dict[str, Any]:
+        items: list[Dict[str, Any]] = []
+        next_page_token: Optional[str] = None
+
+        while True:
+            payload = self.list_pages(doc_id, limit=limit, next_page_token=next_page_token)
+            items.extend(payload.get("items", []))
+            next_page_token = payload.get("nextPageToken")
+            if not next_page_token:
+                return {"items": items}
+
+    def get_page(self, doc_id: str, page_id_or_name: str) -> Dict[str, Any]:
+        return self._request("GET", f"/docs/{self._segment(doc_id)}/pages/{self._segment(page_id_or_name)}")
 
     def create_page(
         self,
@@ -76,11 +94,18 @@ class CodaBackend:
             },
         )
 
-    def get_page_content(self, doc_id: str, page_id_or_name: str) -> str:
+    def export_page(
+        self,
+        doc_id: str,
+        page_id_or_name: str,
+        output_format: str = "markdown",
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        self._report_progress(progress_callback, f"Exporting page as {output_format}...")
         export_job = self._request(
             "POST",
             f"/docs/{self._segment(doc_id)}/pages/{self._segment(page_id_or_name)}/export",
-            body={"outputFormat": "markdown"},
+            body={"outputFormat": output_format},
         )
 
         request_id = export_job.get("id")
@@ -88,7 +113,8 @@ class CodaBackend:
             raise CodaApiError("Page export did not return a request id")
 
         download_link = None
-        for _ in range(self.export_max_attempts):
+        for attempt in range(1, self.export_max_attempts + 1):
+            self._report_progress(progress_callback, f"Polling export status ({attempt}/{self.export_max_attempts})...")
             status = self._request(
                 "GET",
                 f"/docs/{self._segment(doc_id)}/pages/{self._segment(page_id_or_name)}/export/{self._segment(request_id)}",
@@ -103,7 +129,28 @@ class CodaBackend:
         if not download_link:
             raise CodaApiError("Page export did not complete before the polling limit")
 
-        return self._request("GET", None, absolute_url=download_link, include_auth=False, parse_json=False)
+        self._report_progress(progress_callback, "Downloading exported page...")
+        return self._request(
+            "GET",
+            None,
+            absolute_url=download_link,
+            include_auth=False,
+            parse_json=False,
+            response_label=f"exported page {output_format}",
+        )
+
+    def get_page_content(
+        self,
+        doc_id: str,
+        page_id_or_name: str,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        return self.export_page(
+            doc_id,
+            page_id_or_name,
+            output_format="markdown",
+            progress_callback=progress_callback,
+        )
 
     def update_page_content(
         self,
@@ -307,10 +354,11 @@ class CodaBackend:
         absolute_url: Optional[str] = None,
         include_auth: bool = True,
         parse_json: bool = True,
+        response_label: str = "response",
     ) -> Any:
         url = absolute_url or self._build_url(path or "", query=query)
         data = None
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json" if parse_json else "*/*"}
 
         if include_auth:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -323,14 +371,22 @@ class CodaBackend:
 
         try:
             with urlopen(request, timeout=self.timeout, context=self._ssl_context) as response:
-                payload = response.read().decode("utf-8")
+                payload = self._decode_body_bytes(
+                    response.read(),
+                    response.headers.get("Content-Encoding"),
+                    response_label,
+                )
                 if not parse_json:
-                    return payload
-                if not payload:
+                    return self._decode_text(payload, response_label)
+                text_payload = self._decode_text(payload, response_label)
+                if not text_payload:
                     return {}
-                return json.loads(payload)
+                try:
+                    return json.loads(text_payload)
+                except json.JSONDecodeError as exc:
+                    raise CodaApiError(f"Failed to parse {response_label} as JSON.") from exc
         except HTTPError as exc:
-            raw_body = exc.read().decode("utf-8", errors="replace")
+            raw_body = self._decode_error_body(exc.read(), exc.headers.get("Content-Encoding"))
             try:
                 details = json.loads(raw_body) if raw_body else None
             except json.JSONDecodeError:
@@ -351,6 +407,38 @@ class CodaBackend:
         if os.environ.get("NODE_TLS_REJECT_UNAUTHORIZED", "0") == "0":
             return ssl._create_unverified_context()
         return ssl.create_default_context()
+
+    @staticmethod
+    def _report_progress(progress_callback: Optional[Callable[[str], None]], message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(message)
+
+    @staticmethod
+    def _decode_body_bytes(payload: bytes, content_encoding: Optional[str], response_label: str) -> bytes:
+        is_gzip = "gzip" in (content_encoding or "").lower() or payload.startswith(b"\x1f\x8b")
+        if not is_gzip:
+            return payload
+
+        try:
+            return gzip.decompress(payload)
+        except (OSError, EOFError) as exc:
+            raise CodaApiError(f"Failed to decompress {response_label}.") from exc
+
+    @staticmethod
+    def _decode_text(payload: bytes, response_label: str) -> str:
+        try:
+            return payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CodaApiError(f"Failed to decode {response_label} as UTF-8 text.") from exc
+
+    def _decode_error_body(self, payload: bytes, content_encoding: Optional[str]) -> str:
+        if not payload:
+            return ""
+        try:
+            decoded = self._decode_body_bytes(payload, content_encoding, "error response body")
+        except CodaApiError:
+            decoded = payload
+        return decoded.decode("utf-8", errors="replace")
 
     def _build_url(self, path: str, query: Optional[Dict[str, Any]] = None) -> str:
         base = f"{self.api_base_url}/"
