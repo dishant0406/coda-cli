@@ -383,6 +383,42 @@ def page_summary(page: dict[str, Any], page_lookup: dict[str, dict[str, Any]]) -
     }
 
 
+def is_exact_page_match(page: dict[str, Any], query: str) -> bool:
+    normalized_query = query.casefold()
+    return normalized_query in {page_name(page).casefold(), page_id(page).casefold()}
+
+
+def hydrate_page_ancestry(
+    backend: CodaBackend,
+    doc_id: str,
+    page: dict[str, Any],
+    *,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> dict[str, dict[str, Any]]:
+    page_lookup = {page_id(page): page}
+    current = page
+
+    while True:
+        parent_id = page_parent_id(current)
+        if not parent_id:
+            return page_lookup
+        if parent_id in page_lookup:
+            current = page_lookup[parent_id]
+            continue
+
+        embedded_parent = current.get("parent") or current.get("parentPage")
+        if isinstance(embedded_parent, dict) and embedded_parent.get("id"):
+            page_lookup[parent_id] = embedded_parent
+            current = embedded_parent
+            continue
+
+        if progress_callback is not None:
+            progress_callback(f"Resolving page ancestry for {page_name(page)}...")
+        parent = backend.get_page(doc_id, parent_id)
+        page_lookup[parent_id] = parent
+        current = parent
+
+
 def render_page_items(items: list[dict[str, Any]], *, long_mode: bool = False) -> str:
     if not items:
         return "No pages found."
@@ -648,6 +684,27 @@ def pages_find(
 ) -> None:
     backend = require_backend(app)
     resolved_doc_id = resolve_doc_id(app, doc_id)
+
+    if mode == "exact" and not parent_page and not parent_path:
+        with progress_spinner(app, "Looking up exact page...") as spinner:
+            try:
+                direct_page = backend.get_page(resolved_doc_id, query)
+            except CodaApiError as exc:
+                if exc.status_code not in {400, 404}:
+                    raise
+            else:
+                if is_exact_page_match(direct_page, query):
+                    page_lookup = hydrate_page_ancestry(
+                        backend,
+                        resolved_doc_id,
+                        direct_page,
+                        progress_callback=spinner.update,
+                    )
+                    summary = page_summary(direct_page, page_lookup)
+                    payload = {"query": query, "mode": mode, "items": [summary], "fast_path": True}
+                    emit(app, payload, render_page_matches(payload["items"], "matching pages"))
+                    return
+
     with progress_spinner(app, "Fetching pages...") as spinner:
         items = backend.list_all_pages(resolved_doc_id, progress_callback=spinner.update).get("items", [])
         page_lookup = build_page_lookup(items)

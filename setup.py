@@ -8,7 +8,7 @@ README = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
 
 setup(
     name="coda-cli",
-    version="0.1.3",
+    version="0.1.4",
     description="Stateful CLI for Coda docs, pages, tables, and rows",
     long_description=README,
     long_description_content_type="text/markdown",

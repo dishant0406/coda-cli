@@ -206,6 +206,25 @@ class CliWorkflowTests(unittest.TestCase):
         payload = json.loads(result.output)
         self.assertEqual(payload["items"][0]["path"], "Engineering/GrowwBot SDK")
 
+    def test_pages_find_exact_uses_direct_lookup_first(self) -> None:
+        runner = CliRunner()
+        backend = mock.Mock()
+        backend.get_page.return_value = {"id": "page-2", "name": "GrowwBot SDK", "parent": {"id": "page-1", "name": "Engineering"}}
+
+        with runner.isolated_filesystem():
+            session_path = Path("session.json")
+            env = {"CODA_API_KEY": "test-key", "CODA_SESSION_PATH": str(session_path)}
+            SessionStore(session_path).save(SessionState(current_doc_id="doc-1"))
+            with mock.patch("coda_cli.coda_cli.CodaBackend", return_value=backend):
+                result = runner.invoke(cli, ["pages", "find", "GrowwBot SDK", "--mode", "exact", "--json"], env=env)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        payload = json.loads(result.output)
+        self.assertTrue(payload["fast_path"])
+        self.assertEqual(payload["items"][0]["name"], "GrowwBot SDK")
+        backend.get_page.assert_called_once_with("doc-1", "GrowwBot SDK")
+        backend.list_all_pages.assert_not_called()
+
     def test_pages_get_rejects_ambiguous_page_names(self) -> None:
         runner = CliRunner()
         backend = mock.Mock()
