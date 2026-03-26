@@ -344,6 +344,10 @@ def normalize_page_path(value: str) -> str:
     return "/".join(segment.strip() for segment in value.split("/") if segment.strip()).casefold()
 
 
+def split_page_path(value: str) -> list[str]:
+    return [segment.strip() for segment in value.split("/") if segment.strip()]
+
+
 def build_page_path(page: dict[str, Any], page_lookup: dict[str, dict[str, Any]]) -> str:
     segments: list[str] = []
     current = page
@@ -419,6 +423,56 @@ def hydrate_page_ancestry(
         current = parent
 
 
+def try_resolve_page_path_fast(
+    backend: CodaBackend,
+    doc_id: str,
+    page_path: str,
+    *,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Optional[tuple[dict[str, Any], dict[str, dict[str, Any]]]]:
+    path_segments = split_page_path(page_path)
+    if not path_segments:
+        return None
+
+    leaf_name = path_segments[-1]
+    if progress_callback is not None:
+        progress_callback(f"Looking up exact page {leaf_name!r}...")
+
+    try:
+        page = backend.get_page(doc_id, leaf_name)
+    except CodaApiError as exc:
+        if exc.status_code in {400, 404}:
+            return None
+        raise
+
+    page_lookup = hydrate_page_ancestry(
+        backend,
+        doc_id,
+        page,
+        progress_callback=progress_callback,
+    )
+    resolved_path = normalize_page_path(build_page_path(page, page_lookup))
+    target_path = normalize_page_path(page_path)
+    if resolved_path == target_path:
+        return page, page_lookup
+    return None
+
+
+def try_resolve_parent_path_fast(
+    backend: CodaBackend,
+    doc_id: str,
+    parent_path: str,
+    *,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Optional[tuple[dict[str, Any], dict[str, dict[str, Any]]]]:
+    return try_resolve_page_path_fast(
+        backend,
+        doc_id,
+        parent_path,
+        progress_callback=progress_callback,
+    )
+
+
 def render_page_items(items: list[dict[str, Any]], *, long_mode: bool = False) -> str:
     if not items:
         return "No pages found."
@@ -492,6 +546,16 @@ def resolve_page(
     label: str = "page",
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    if page_path:
+        fast_match = try_resolve_page_path_fast(
+            backend,
+            doc_id,
+            page_path,
+            progress_callback=progress_callback,
+        )
+        if fast_match is not None:
+            return fast_match
+
     pages = backend.list_all_pages(doc_id, progress_callback=progress_callback).get("items", [])
     return resolve_page_from_inventory(
         app,
@@ -684,6 +748,42 @@ def pages_find(
 ) -> None:
     backend = require_backend(app)
     resolved_doc_id = resolve_doc_id(app, doc_id)
+
+    if mode == "exact" and parent_path and not parent_page:
+        with progress_spinner(app, "Resolving exact page with parent path...") as spinner:
+            fast_parent = try_resolve_parent_path_fast(
+                backend,
+                resolved_doc_id,
+                parent_path,
+                progress_callback=spinner.update,
+            )
+            if fast_parent is not None:
+                try:
+                    direct_page = backend.get_page(resolved_doc_id, query)
+                except CodaApiError as exc:
+                    if exc.status_code not in {400, 404}:
+                        raise
+                else:
+                    if is_exact_page_match(direct_page, query):
+                        page_lookup = hydrate_page_ancestry(
+                            backend,
+                            resolved_doc_id,
+                            direct_page,
+                            progress_callback=spinner.update,
+                        )
+                        parent_summary = page_summary(fast_parent[0], fast_parent[1])
+                        page_lookup.update(fast_parent[1])
+                        summary = page_summary(direct_page, page_lookup)
+                        if summary["parent_id"] == parent_summary["id"]:
+                            payload = {
+                                "query": query,
+                                "mode": mode,
+                                "items": [summary],
+                                "fast_path": True,
+                                "parent_path": parent_path,
+                            }
+                            emit(app, payload, render_page_matches(payload["items"], "matching pages"))
+                            return
 
     if mode == "exact" and not parent_page and not parent_path:
         with progress_spinner(app, "Looking up exact page...") as spinner:

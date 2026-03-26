@@ -225,6 +225,36 @@ class CliWorkflowTests(unittest.TestCase):
         backend.get_page.assert_called_once_with("doc-1", "GrowwBot SDK")
         backend.list_all_pages.assert_not_called()
 
+    def test_pages_find_exact_with_parent_path_uses_fast_path(self) -> None:
+        runner = CliRunner()
+        backend = mock.Mock()
+
+        def fake_get_page(doc_id: str, page_ref: str) -> dict[str, object]:
+            if page_ref == "GR-1":
+                return {"id": "page-gr1", "name": "GR-1", "parent": {"id": "page-web", "name": "Web Team"}}
+            if page_ref == "GrowwBot SDK":
+                return {"id": "page-sdk", "name": "GrowwBot SDK", "parent": {"id": "page-gr1", "name": "GR-1"}}
+            raise AssertionError(page_ref)
+
+        backend.get_page.side_effect = fake_get_page
+
+        with runner.isolated_filesystem():
+            session_path = Path("session.json")
+            env = {"CODA_API_KEY": "test-key", "CODA_SESSION_PATH": str(session_path)}
+            SessionStore(session_path).save(SessionState(current_doc_id="doc-1"))
+            with mock.patch("coda_cli.coda_cli.CodaBackend", return_value=backend):
+                result = runner.invoke(
+                    cli,
+                    ["pages", "find", "GrowwBot SDK", "--mode", "exact", "--parent-path", "Web Team/GR-1", "--json"],
+                    env=env,
+                )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        payload = json.loads(result.output)
+        self.assertTrue(payload["fast_path"])
+        self.assertEqual(payload["items"][0]["path"], "Web Team/GR-1/GrowwBot SDK")
+        backend.list_all_pages.assert_not_called()
+
     def test_pages_get_rejects_ambiguous_page_names(self) -> None:
         runner = CliRunner()
         backend = mock.Mock()
