@@ -12,6 +12,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,36 +48,39 @@ class StubCodaHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path.startswith("/docs?query=example"):
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+
+        if parsed.path == "/docs" and query.get("query") == ["example"]:
             self._send_json({"items": [{"id": "doc-1", "name": "Example Doc"}]})
             return
 
-        if self.path == "/docs/doc-1":
+        if parsed.path == "/docs/doc-1":
             self._send_json({"id": "doc-1", "name": "Example Doc"})
             return
 
-        if self.path == "/docs/doc-1/pages":
+        if parsed.path == "/docs/doc-1/pages":
             self._send_json({"items": [{"id": "page-1", "name": "Example Page"}]})
             return
 
-        if self.path == "/docs/doc-1/tables":
+        if parsed.path == "/docs/doc-1/tables":
             self._send_json({"items": [{"id": "grid-1", "name": "Tasks"}]})
             return
 
-        if self.path == "/docs/doc-1/tables/grid-1":
+        if parsed.path == "/docs/doc-1/tables/grid-1":
             self._send_json({"id": "grid-1", "name": "Tasks", "tableType": "table"})
             return
 
-        if self.path == "/docs/doc-1/tables/grid-1/columns":
+        if parsed.path == "/docs/doc-1/tables/grid-1/columns":
             self._send_json({"items": [{"id": "c-name", "name": "Name", "type": "text"}]})
             return
 
-        if self.path == "/docs/doc-1/pages/page-1/export/export-1":
+        if parsed.path == "/docs/doc-1/pages/page-1/export/export-1":
             base = f"http://127.0.0.1:{self.server.server_address[1]}"
             self._send_json({"status": "complete", "downloadLink": f"{base}/download/page-1.md"})
             return
 
-        if self.path == "/download/page-1.md":
+        if parsed.path == "/download/page-1.md":
             self._send_bytes(
                 gzip.compress(b"# Example Page\nBody"),
                 content_type="text/markdown",

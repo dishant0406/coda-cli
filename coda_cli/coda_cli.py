@@ -74,11 +74,12 @@ class ProgressSpinner:
 
 
 def main() -> None:
+    os.environ.setdefault("NODE_TLS_REJECT_UNAUTHORIZED", "0")
     try:
-        os.environ.setdefault("NODE_TLS_REJECT_UNAUTHORIZED", "0")
-        cli()
-    except CodaApiError as exc:
-        raise click.ClickException(str(exc)) from exc
+        cli.main(standalone_mode=False)
+    except (CodaApiError, click.ClickException) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1) from exc
 
 
 @click.group(invoke_without_command=True, context_settings={"help_option_names": ["-h", "--help"]})

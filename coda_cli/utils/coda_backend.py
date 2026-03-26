@@ -28,6 +28,9 @@ class CodaApiError(Exception):
 
 
 class CodaBackend:
+    DEFAULT_PAGE_BATCH_SIZE = 25
+    TRANSIENT_HTTP_STATUS_CODES = frozenset({502, 503, 504})
+
     def __init__(
         self,
         api_key: str,
@@ -70,11 +73,20 @@ class CodaBackend:
         items: list[Dict[str, Any]] = []
         next_page_token: Optional[str] = None
         page_number = 0
+        page_batch_size = limit or self.DEFAULT_PAGE_BATCH_SIZE
 
         while True:
             page_number += 1
             self._report_progress(progress_callback, f"Fetching pages batch {page_number} ({len(items)} loaded)...")
-            payload = self.list_pages(doc_id, limit=limit, next_page_token=next_page_token)
+            try:
+                payload = self.list_pages(doc_id, limit=page_batch_size, next_page_token=next_page_token)
+            except CodaApiError as exc:
+                if exc.status_code in self.TRANSIENT_HTTP_STATUS_CODES:
+                    raise CodaApiError(
+                        "Coda timed out while listing pages for this document. "
+                        "Retry the command, or narrow the search with --parent-page/--parent-path."
+                    ) from exc
+                raise
             items.extend(payload.get("items", []))
             next_page_token = payload.get("nextPageToken")
             if not next_page_token:
@@ -369,6 +381,7 @@ class CodaBackend:
         url = absolute_url or self._build_url(path or "", query=query)
         data = None
         headers = {"Accept": "application/json" if parse_json else "*/*"}
+        attempt_count = 3 if method.upper() == "GET" else 1
 
         if include_auth:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -379,46 +392,65 @@ class CodaBackend:
 
         request = Request(url, data=data, method=method, headers=headers)
 
-        try:
-            with urlopen(request, timeout=self.timeout, context=self._ssl_context) as response:
-                payload = self._decode_body_bytes(
-                    response.read(),
-                    response.headers.get("Content-Encoding"),
-                    response_label,
-                )
-                if not parse_json:
-                    return self._decode_text(payload, response_label)
-                text_payload = self._decode_text(payload, response_label)
-                if not text_payload:
-                    return {}
-                try:
-                    return json.loads(text_payload)
-                except json.JSONDecodeError as exc:
-                    raise CodaApiError(f"Failed to parse {response_label} as JSON.") from exc
-        except HTTPError as exc:
-            raw_body = self._decode_error_body(exc.read(), exc.headers.get("Content-Encoding"))
+        for attempt in range(1, attempt_count + 1):
             try:
-                details = json.loads(raw_body) if raw_body else None
-            except json.JSONDecodeError:
-                details = raw_body or None
+                with urlopen(request, timeout=self.timeout, context=self._ssl_context) as response:
+                    payload = self._decode_body_bytes(
+                        response.read(),
+                        response.headers.get("Content-Encoding"),
+                        response_label,
+                    )
+                    if not parse_json:
+                        return self._decode_text(payload, response_label)
+                    text_payload = self._decode_text(payload, response_label)
+                    if not text_payload:
+                        return {}
+                    try:
+                        return json.loads(text_payload)
+                    except json.JSONDecodeError as exc:
+                        raise CodaApiError(f"Failed to parse {response_label} as JSON.") from exc
+            except HTTPError as exc:
+                if self._should_retry_http_error(exc, attempt, attempt_count):
+                    time.sleep(self._retry_delay(attempt))
+                    continue
+                raw_body = self._decode_error_body(exc.read(), exc.headers.get("Content-Encoding"))
+                try:
+                    details = json.loads(raw_body) if raw_body else None
+                except json.JSONDecodeError:
+                    details = raw_body or None
 
-            message = "Coda API request failed"
-            if isinstance(details, dict):
-                message = details.get("message") or details.get("statusMessage") or message
-            elif isinstance(details, str) and details:
-                message = details
+                message = "Coda API request failed"
+                if isinstance(details, dict):
+                    message = details.get("message") or details.get("statusMessage") or message
+                elif isinstance(details, str) and details:
+                    message = details
 
-            raise CodaApiError(message=message, status_code=exc.code, details=details) from exc
-        except (TimeoutError, socket.timeout) as exc:
-            raise CodaApiError("Timed out waiting for the Coda API response.") from exc
-        except URLError as exc:
-            raise CodaApiError(f"Failed to reach Coda API: {exc.reason}") from exc
+                raise CodaApiError(message=message, status_code=exc.code, details=details) from exc
+            except (TimeoutError, socket.timeout) as exc:
+                if attempt < attempt_count:
+                    time.sleep(self._retry_delay(attempt))
+                    continue
+                raise CodaApiError("Timed out waiting for the Coda API response.") from exc
+            except URLError as exc:
+                if attempt < attempt_count:
+                    time.sleep(self._retry_delay(attempt))
+                    continue
+                raise CodaApiError(f"Failed to reach Coda API: {exc.reason}") from exc
+
+        raise CodaApiError("Coda API request failed after retries.")
 
     @staticmethod
     def _build_ssl_context() -> ssl.SSLContext:
         if os.environ.get("NODE_TLS_REJECT_UNAUTHORIZED", "0") == "0":
             return ssl._create_unverified_context()
         return ssl.create_default_context()
+
+    def _should_retry_http_error(self, exc: HTTPError, attempt: int, attempt_count: int) -> bool:
+        return exc.code in self.TRANSIENT_HTTP_STATUS_CODES and attempt < attempt_count
+
+    @staticmethod
+    def _retry_delay(attempt: int) -> float:
+        return min(0.5 * attempt, 2.0)
 
     @staticmethod
     def _report_progress(progress_callback: Optional[Callable[[str], None]], message: str) -> None:

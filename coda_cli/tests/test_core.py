@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest import mock
 
 from click.testing import CliRunner
 
-from coda_cli.coda_cli import cli
+from coda_cli.coda_cli import cli, main
 from coda_cli.core.state import SessionState, SessionStore
 from coda_cli.utils.coda_backend import CodaApiError, CodaBackend
 
@@ -62,6 +64,22 @@ class SessionStoreTests(unittest.TestCase):
 
 
 class CodaBackendTests(unittest.TestCase):
+    def test_transient_http_error_is_retried_for_get_requests(self) -> None:
+        backend = CodaBackend(api_key="test-key")
+        transient = HTTPError(
+            "https://example.test/docs",
+            504,
+            "Gateway Timeout",
+            hdrs={},
+            fp=io.BytesIO(b'{"message":"Gateway Timeout"}'),
+        )
+        responses = [transient, FakeResponse("{}")]
+
+        with mock.patch("coda_cli.utils.coda_backend.urlopen", side_effect=responses):
+            payload = backend.list_documents()
+
+        self.assertEqual(payload, {})
+
     def test_requests_default_to_no_timeout(self) -> None:
         backend = CodaBackend(api_key="test-key")
         captured = {}
@@ -122,6 +140,18 @@ class CodaBackendTests(unittest.TestCase):
                 backend.get_page_content("doc-1", "page-1")
 
         self.assertIn("Failed to decode exported page markdown as UTF-8 text.", str(context.exception))
+
+
+class MainEntrypointTests(unittest.TestCase):
+    def test_main_prints_clean_error_for_api_failures(self) -> None:
+        with mock.patch("coda_cli.coda_cli.cli.main", side_effect=CodaApiError("504: Gateway Timeout")), mock.patch(
+            "click.echo"
+        ) as echo:
+            with self.assertRaises(SystemExit) as context:
+                main()
+
+        self.assertEqual(context.exception.code, 1)
+        echo.assert_called_once_with("Error: 504: Gateway Timeout", err=True)
 
 
 class CliWorkflowTests(unittest.TestCase):
