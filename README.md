@@ -7,13 +7,13 @@ Stateful CLI for Coda docs, pages, tables, and rows.
 Recommended:
 
 ```bash
-pipx install git+https://github.com/dishant0406/coda-cli.git
+pipx install --force git+https://github.com/dishant0406/coda-cli.git
 ```
 
 Alternative:
 
 ```bash
-python3 -m pip install git+https://github.com/dishant0406/coda-cli.git
+python3 -m pip install --upgrade git+https://github.com/dishant0406/coda-cli.git
 ```
 
 ## Command
