@@ -11,19 +11,19 @@ DEFAULT_API_BASE_URL = "https://coda.io/apis/v1"
 
 
 def default_session_path() -> Path:
-    raw = os.environ.get("CODA_SESSION_PATH") or os.environ.get("CLI_ANYTHING_CODA_SESSION_PATH")
+    raw = os.environ.get("CODA_SESSION_PATH")
     if raw:
         return Path(raw).expanduser()
 
     xdg_state_home = os.environ.get("XDG_STATE_HOME")
     if xdg_state_home:
-        return Path(xdg_state_home).expanduser() / "cli-anything-coda" / "session.json"
+        return Path(xdg_state_home).expanduser() / "coda-cli" / "session.json"
 
     codex_memories = Path.home() / ".codex" / "memories"
     if codex_memories.exists():
-        return codex_memories / "cli-anything-coda" / "session.json"
+        return codex_memories / "coda-cli" / "session.json"
 
-    return Path.home() / ".local" / "state" / "cli-anything-coda" / "session.json"
+    return Path.home() / ".local" / "state" / "coda-cli" / "session.json"
 
 
 @dataclass

@@ -6,7 +6,7 @@ Validate that the harness is installable, stateful, and aligned with the `coda-m
 
 ## Unit coverage
 
-File: `cli_anything/coda/tests/test_core.py`
+File: `coda_cli/tests/test_core.py`
 
 - session store round-trip
 - local undo and redo behavior
@@ -17,7 +17,7 @@ File: `cli_anything/coda/tests/test_core.py`
 
 ## End-to-end coverage
 
-File: `cli_anything/coda/tests/test_full_e2e.py`
+File: `coda_cli/tests/test_full_e2e.py`
 
 - `docs list` JSON output
 - session selection with `docs use`
@@ -27,12 +27,12 @@ File: `cli_anything/coda/tests/test_full_e2e.py`
 
 ## Validation commands
 
-From `agent-harness/`:
+From the repo root:
 
 ```bash
 python3 -m pip install -e .
-python3 -m unittest discover -s cli_anything/coda/tests -p 'test_*.py'
-cli-anything-coda --json docs list --query example
+python3 -m unittest discover -s coda_cli/tests -p 'test_*.py'
+coda-cli --json docs list --query example
 ```
 
 ## Required environment

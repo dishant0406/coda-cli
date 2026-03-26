@@ -8,9 +8,9 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from cli_anything.coda.coda_cli import cli
-from cli_anything.coda.core.state import SessionState, SessionStore
-from cli_anything.coda.utils.coda_backend import CodaBackend
+from coda_cli.coda_cli import cli
+from coda_cli.core.state import SessionState, SessionStore
+from coda_cli.utils.coda_backend import CodaBackend
 
 
 class FakeResponse:
@@ -62,13 +62,13 @@ class CodaBackendTests(unittest.TestCase):
         backend = CodaBackend(api_key="test-key")
         captured = {}
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, context=None):
             captured["url"] = request.full_url
             captured["method"] = request.get_method()
             captured["body"] = json.loads(request.data.decode("utf-8"))
             return FakeResponse("{}")
 
-        with mock.patch("cli_anything.coda.utils.coda_backend.urlopen", side_effect=fake_urlopen):
+        with mock.patch("coda_cli.utils.coda_backend.urlopen", side_effect=fake_urlopen):
             backend.update_page_content("doc-1", "page-1", "# Updated", insertion_mode="append", element_id="el-1")
 
         self.assertEqual(captured["method"], "PUT")
@@ -85,8 +85,8 @@ class CodaBackendTests(unittest.TestCase):
             FakeResponse("# Heading\nBody"),
         ]
 
-        with mock.patch("cli_anything.coda.utils.coda_backend.urlopen", side_effect=responses), mock.patch(
-            "cli_anything.coda.utils.coda_backend.time.sleep", return_value=None
+        with mock.patch("coda_cli.utils.coda_backend.urlopen", side_effect=responses), mock.patch(
+            "coda_cli.utils.coda_backend.time.sleep", return_value=None
         ):
             content = backend.get_page_content("doc-1", "page-1")
 
@@ -102,7 +102,7 @@ class CliWorkflowTests(unittest.TestCase):
         with runner.isolated_filesystem():
             session_path = Path("session.json")
             env = {"CODA_API_KEY": "test-key", "CODA_SESSION_PATH": str(session_path)}
-            with mock.patch("cli_anything.coda.coda_cli.CodaBackend", return_value=backend):
+            with mock.patch("coda_cli.coda_cli.CodaBackend", return_value=backend):
                 result = runner.invoke(
                     cli,
                     [
@@ -147,7 +147,7 @@ class CliWorkflowTests(unittest.TestCase):
         with runner.isolated_filesystem():
             session_path = Path("session.json")
             env = {"CODA_API_KEY": "test-key", "CODA_SESSION_PATH": str(session_path)}
-            with mock.patch("cli_anything.coda.coda_cli.CodaBackend", return_value=backend):
+            with mock.patch("coda_cli.coda_cli.CodaBackend", return_value=backend):
                 result = runner.invoke(
                     cli,
                     ["--json", "tables", "schema", "--doc-id", "doc-1", "grid-1"],

@@ -1,10 +1,10 @@
-# Coda CLI-Anything Harness
+# Coda CLI
 
 Target software: `coda-mcp`
 
 Source path: `/Users/dishants/projects/coda-cli`
 
-This harness translates the repository's Coda MCP capability set into a stateful operator CLI with:
+This project translates the repository's Coda MCP capability set into a stateful operator CLI with:
 
 - document, page, table, row, and link commands
 - higher-level workflows for schema inspection, page content copy, and field-based row writes
@@ -12,6 +12,7 @@ This harness translates the repository's Coda MCP capability set into a stateful
 - machine-readable `--json` output
 - a local session store for current doc, table, and page selection
 - local undo and redo for session context changes
+- TLS verification disabled by default for self-signed HTTPS compatibility via `NODE_TLS_REJECT_UNAUTHORIZED=0`
 
 Backend choice:
 

@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 import click
 
-from cli_anything.coda.core.repl import run_repl
-from cli_anything.coda.core.state import DEFAULT_API_BASE_URL, SessionState, SessionStore, default_session_path
-from cli_anything.coda.utils.coda_backend import CodaApiError, CodaBackend
+from coda_cli.core.repl import run_repl
+from coda_cli.core.state import DEFAULT_API_BASE_URL, SessionState, SessionStore, default_session_path
+from coda_cli.utils.coda_backend import CodaApiError, CodaBackend
 
 
 @dataclass
@@ -23,6 +24,7 @@ class AppContext:
 
 def main() -> None:
     try:
+        os.environ.setdefault("NODE_TLS_REJECT_UNAUTHORIZED", "0")
         cli()
     except CodaApiError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -69,7 +71,7 @@ def cli(
     )
 
     if ctx.invoked_subcommand is None:
-        run_repl(cli, ctx.obj, ctx.info_name or "cli-anything-coda")
+        run_repl(cli, ctx.obj, ctx.info_name or "coda-cli")
 
 
 def emit(app: AppContext, payload: Any, text: Optional[str] = None) -> None:

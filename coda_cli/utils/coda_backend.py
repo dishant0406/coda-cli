@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import ssl
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -8,7 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, quote
 from urllib.request import Request, urlopen
 
-from cli_anything.coda.core.state import DEFAULT_API_BASE_URL
+from coda_cli.core.state import DEFAULT_API_BASE_URL
 
 
 @dataclass
@@ -37,6 +39,7 @@ class CodaBackend:
         self.timeout = timeout
         self.export_poll_interval = export_poll_interval
         self.export_max_attempts = export_max_attempts
+        self._ssl_context = self._build_ssl_context()
 
     def list_documents(self, query: Optional[str] = None) -> Dict[str, Any]:
         return self._request("GET", "/docs", query=self._compact_query({"query": query}))
@@ -319,7 +322,7 @@ class CodaBackend:
         request = Request(url, data=data, method=method, headers=headers)
 
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with urlopen(request, timeout=self.timeout, context=self._ssl_context) as response:
                 payload = response.read().decode("utf-8")
                 if not parse_json:
                     return payload
@@ -342,6 +345,12 @@ class CodaBackend:
             raise CodaApiError(message=message, status_code=exc.code, details=details) from exc
         except URLError as exc:
             raise CodaApiError(f"Failed to reach Coda API: {exc.reason}") from exc
+
+    @staticmethod
+    def _build_ssl_context() -> ssl.SSLContext:
+        if os.environ.get("NODE_TLS_REJECT_UNAUTHORIZED", "0") == "0":
+            return ssl._create_unverified_context()
+        return ssl.create_default_context()
 
     def _build_url(self, path: str, query: Optional[Dict[str, Any]] = None) -> str:
         base = f"{self.api_base_url}/"

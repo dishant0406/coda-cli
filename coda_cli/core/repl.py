@@ -6,7 +6,7 @@ import click
 
 
 def run_repl(cli: click.BaseCommand, ctx_obj: object, prog_name: str) -> None:
-    click.echo("CLI-Anything Coda REPL. Type 'help' for commands and 'exit' to quit.")
+    click.echo("Coda CLI REPL. Type 'help' for commands and 'exit' to quit.")
 
     while True:
         try:

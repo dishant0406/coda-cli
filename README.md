@@ -24,17 +24,12 @@ After install, run:
 coda-cli --help
 ```
 
-The legacy alias is also kept:
-
-```bash
-cli-anything-coda --help
-```
-
 ## Environment
 
 - `CODA_API_KEY` or `API_KEY`
 - `CODA_API_BASE_URL` for overrides or testing
 - `CODA_SESSION_PATH` for a custom session file
+- `NODE_TLS_REJECT_UNAUTHORIZED=0` is honored for self-signed HTTPS endpoints and is the default in this CLI. Set it to `1` to enforce TLS verification.
 
 ## Examples
 

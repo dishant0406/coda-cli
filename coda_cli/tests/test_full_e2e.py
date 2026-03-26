@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class StubCodaHandler(BaseHTTPRequestHandler):
@@ -93,7 +93,7 @@ class FullE2ETests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.session_path = Path(self.tempdir.name) / "session.json"
         self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        self.cli_bin = shutil.which("cli-anything-coda")
+        self.cli_bin = shutil.which("coda-cli")
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -101,13 +101,14 @@ class FullE2ETests(unittest.TestCase):
     def cli_command(self) -> list[str]:
         if self.cli_bin:
             return [self.cli_bin]
-        return [sys.executable, "-m", "cli_anything.coda"]
+        return [sys.executable, "-m", "coda_cli"]
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["CODA_API_KEY"] = "test-key"
         env["CODA_API_BASE_URL"] = self.base_url
         env["CODA_SESSION_PATH"] = str(self.session_path)
+        env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
         env["PYTHONPATH"] = f"{ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}".rstrip(os.pathsep)
         return subprocess.run(
             [*self.cli_command(), *args],
